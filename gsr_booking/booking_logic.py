@@ -3,11 +3,10 @@ import math
 import random
 
 import requests
-
-
-MAX_SLOT_HRS = 2.0  # the longest booking allowed per person
+from gsr_booking.models import GSRBookingCredentials
+from django.contrib.auth import get_user_model
 MIN_SLOT_HRS = 0.5  # the minimum booking allowed per person
-
+User = get_user_model()
 
 def book_rooms_for_group(group, rooms, requester_pennkey):
     """ makes a request to labs api server to book rooms for group """
@@ -28,7 +27,6 @@ def book_rooms_for_group(group, rooms, requester_pennkey):
         return result_json
 
     # randomize order, and put requester first in the order
-    random.shuffle(members)
     for (i, member) in enumerate(members):  # puts the requester as the first person
         if member["username"] == requester_pennkey:
             temp = members[0]
@@ -59,9 +57,6 @@ def book_rooms_for_group(group, rooms, requester_pennkey):
             booking_slots, lid, roomid, end, next_start, next_end
         )
         room_json_array.append(room_json)
-        print(room_complete_success)
-        print(error)
-        print("-------")
         complete_success = complete_success and room_complete_success and (error is None)
         partial_success = partial_success or room_partial_success
         fatal_error = fatal_error or room_fatal_error
@@ -74,27 +69,79 @@ def book_rooms_for_group(group, rooms, requester_pennkey):
 
 def book_room_for_group(members, is_wharton, room, lid, start, end):
     """returns (booking_slots, next_start, next_end, error, isFatalError)"""
-    if is_wharton:  # huntsman reservation
-        return ([], start, end, "Unable to book huntsman rooms yet", True)
-    else:  # lib reservation
-        # Find the first timeslot to book for (next_start, next_end)
-        next_start = start
-        next_end = min(end, next_start + datetime.timedelta(hours=MAX_SLOT_HRS))
+    MAX_SLOT_HRS = 1.5  # the longest booking allowed per person
+    if not is_wharton:
+        MAX_SLOT_HRS = 2.0
 
-        # loop through each member, and attempt to book on their behalf
-        booking_slots = []  # booking_slots is an array of (i.e. 30 minute) booking_slots
-        failed_members = []  # store the members w/ failed bookings in here
-        error = None
-        for member in members:
-            if next_end - next_start < datetime.timedelta(hours=MIN_SLOT_HRS):
-                break
-            if member["user__email"] == "":
-                continue  # this member cannot be used for libcal booking b/c email required
+    next_start = start
+    next_end = min(end, next_start + datetime.timedelta(hours=MAX_SLOT_HRS))
 
-            # make 'blind-booking' request to labs-api-server first
+    # loop through each member, and attempt to book on their behalf
+    booking_slots = []  # booking_slots is an array of (i.e. 30 minute) booking_slots
+    failed_members = []  # store the members w/ failed bookings in here
+    error = None
+    for member in members:
+        session_id = get_session_id_for_user(member['user'])
+        if (member['username'] == 'rehaan'):
+            session_id = 'tsleg35vwgexb34xnkzu5e5nruoynjva' #custom override for testing purposes
+
+        if (is_wharton and session_id == None) or (not is_wharton and member["user__email"] == ""):
+            continue # this member cannot be used for huntsman booking b/c missing info
+        if next_end - next_start < datetime.timedelta(hours=MIN_SLOT_HRS):
+            break
+
+        # make 'blind-booking' request to labs-api-server first
+        try:
+            success = book_room_for_user(
+                    room, lid, next_start.isoformat(), next_end.isoformat(), member["user__email"], session_id
+                )
+            if success:
+                new_booking_slots = split_booking(
+                    next_start, next_end, member["username"], True
+                )
+                booking_slots.extend(new_booking_slots)
+
+                next_start = next_end
+                next_end = min(end, next_start + datetime.timedelta(hours=MAX_SLOT_HRS))
+            else:
+                failed_members.append(member)
+        except BookingError as e:
+            error = e
+            if is_fatal_error(e):
+                return (booking_slots, next_start, next_end, error, True)
+            else:
+                failed_members.append(member)
+
+    # if unbooked slots still remain, loop through each member again
+    # but get reservation credits first to see how much we can book
+    for member in failed_members:
+        session_id = get_session_id_for_user(member['user'])
+        if (member['username'] == 'rehaan'):
+            session_id = 'tsleg35vwgexb34xnkzu5e5nruoynjva' #custom override for testing purposes
+
+        if next_end - next_start < datetime.timedelta(hours=MIN_SLOT_HRS):
+            break  # booked everything already
+        if (is_wharton and session_id == None) or (not is_wharton and member["user__email"] == ""):
+            continue # this member cannot be used for huntsman booking b/c missing info
+
+        # calculate number of credits already used via getReservations
+        (success, used_credit_hours) = get_used_booking_credit_for_user(
+            lid, member["user__email"]
+        )
+        remaining_credit_hours = MAX_SLOT_HRS - used_credit_hours
+        rounded_remaining_credit_hours = math.floor(2 * remaining_credit_hours) / 2
+        if success and remaining_credit_hours >= MIN_SLOT_HRS:
+            next_end = min(
+                end, next_start + datetime.timedelta(hours=rounded_remaining_credit_hours),
+            )
             try:
                 success = book_room_for_user(
-                    room, lid, next_start.isoformat(), next_end.isoformat(), member["user__email"]
+                    room,
+                    lid,
+                    next_start.isoformat(),
+                    next_end.isoformat(),
+                    member["user__email"],
+                    session_id
                 )
                 if success:
                     new_booking_slots = split_booking(
@@ -104,57 +151,14 @@ def book_room_for_group(members, is_wharton, room, lid, start, end):
 
                     next_start = next_end
                     next_end = min(end, next_start + datetime.timedelta(hours=MAX_SLOT_HRS))
-                else:
-                    failed_members.append(member)
             except BookingError as e:
                 error = e
                 if is_fatal_error(e):
                     return (booking_slots, next_start, next_end, error, True)
-                else:
-                    failed_members.append(member)
-
-        # if unbooked slots still remain, loop through each member again
-        # but get reservation credits first to see how much we can book
-        for member in failed_members:
-            if next_end - next_start < datetime.timedelta(hours=MIN_SLOT_HRS):
-                break  # booked everything already
-            if member["user__email"] == "":
-                continue  # this member cannot be used for libcal booking b/c email required
-
-            # calculate number of credits already used via getReservations
-            (success, used_credit_hours) = get_used_booking_credit_for_user(
-                lid, member["user__email"]
-            )
-            remaining_credit_hours = MAX_SLOT_HRS - used_credit_hours
-            rounded_remaining_credit_hours = math.floor(2 * remaining_credit_hours) / 2
-            if success and remaining_credit_hours >= MIN_SLOT_HRS:
-                next_end = min(
-                    end, next_start + datetime.timedelta(hours=rounded_remaining_credit_hours),
-                )
-                try:
-                    success = book_room_for_user(
-                        room,
-                        lid,
-                        next_start.isoformat(),
-                        next_end.isoformat(),
-                        member["user__email"],
-                    )
-                    if success:
-                        new_booking_slots = split_booking(
-                            next_start, next_end, member["username"], True
-                        )
-                        booking_slots.extend(new_booking_slots)
-
-                        next_start = next_end
-                        next_end = min(end, next_start + datetime.timedelta(hours=MAX_SLOT_HRS))
-                except BookingError as e:
-                    error = e
-                    if is_fatal_error(e):
-                        return (booking_slots, next_start, next_end, error, True)
-        if next_start >= end:
-            # even if there was a daily limit error, delete it if all rooms were booked
-            error = None
-        return (booking_slots, next_start, next_end, error, False)
+    if next_start >= end:
+        # even if there was a daily limit error, delete it if all rooms were booked
+        error = None
+    return (booking_slots, next_start, next_end, error, False)
 
 
 def is_fatal_error(error):
@@ -219,6 +223,7 @@ def get_used_booking_credit_for_user(lid, email):
     """ returns a user's used booking credit (in hours) for a specific building (lid) """
     RESERVATIONS_URL = "https://api.pennlabs.org/studyspaces/reservations"
     if lid == "1":
+        print("LOL")
         return (False, 0)  # doesn't support huntsman yet
     try:
         r = requests.get(RESERVATIONS_URL + "?email=" + email)
@@ -258,26 +263,19 @@ def split_booking(start, end, pennkey, booked):
         temp_end += datetime.timedelta(hours=MIN_SLOT_HRS)
     return bookings
 
-
-def book_room_for_user(room, lid, start, end, email):
+def book_huntsman_room_for_user(room, lid, start, end, session_id):
     """
     Tries to make a booking for an individual user,
     and returns success or not (and the error) in a tuple
     """
-    if lid == "1":
-        return False  # does not support huntsman booking yet
+
     BOOKING_URL = "https://api.pennlabs.org/studyspaces/book"
     form_data = {
-        "firstname": "Group GSR User",
-        "lastname": "Group GSR User",
-        "groupname": "Group GSR",
-        "size": "2-3",
-        "phone": "2158986533",
         "room": room,
         "lid": lid,
         "start": start,
         "end": end,
-        "email": email,
+        "sessionid": session_id
     }
 
     try:
@@ -291,6 +289,50 @@ def book_room_for_user(room, lid, start, end, email):
         print("error: " + str(e))
     return False
 
+def book_room_for_user(room, lid, start, end, email, session_id):
+    """
+    Tries to make a booking for an individual user,
+    and returns success or not (and the error) in a tuple
+    """
+    BOOKING_URL = "https://api.pennlabs.org/studyspaces/book"
+    form_data = {
+        "room": room,
+        "lid": lid,
+        "start": start,
+        "end": end
+    }
+    if lid == 1:
+        form_data['sessionid'] = session_id
+    else:
+        new_form_data = {
+            "firstname": "Group GSR User",
+            "lastname": "Group GSR User",
+            "groupname": "Group GSR",
+            "size": "2-3",
+            "phone": "2158986533",
+            "email": email
+        }
+        form_data = {**form_data, **new_form_data} #add new form data
+    try:
+        r = requests.post(BOOKING_URL, data=form_data)
+        if r.status_code == 200:
+            resp_data = r.json()
+            if "error" in resp_data and resp_data["error"] is not None:
+                raise BookingError(resp_data["error"])
+            return resp_data["results"]
+
+        print(r.status_code)
+    except requests.exceptions.RequestException as e:
+        print("error: " + str(e))
+    return False
+
+def get_session_id_for_user(user_pk):
+    """ Returns a user's session id (for huntsman bookings) if it exists, or None otherwise """
+    try:
+        cred = GSRBookingCredentials.objects.get(user=user_pk)
+        return cred.session_id
+    except GSRBookingCredentials.DoesNotExist:
+        return None
 
 class BookingError(Exception):
     def __init__(self, error_str):
