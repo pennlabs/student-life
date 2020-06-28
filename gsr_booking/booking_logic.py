@@ -82,11 +82,9 @@ def book_room_for_group(members, is_wharton, room, lid, start, end):
     error = None
     for member in members:
         session_id = get_session_id_for_user(member['user'])
-        if (member['username'] == 'rehaan'):
-            session_id = 'tsleg35vwgexb34xnkzu5e5nruoynjva' #custom override for testing purposes
-
+        
         if (is_wharton and session_id == None) or (not is_wharton and member["user__email"] == ""):
-            continue # this member cannot be used for huntsman booking b/c missing info
+            continue # this member cannot be used for booking b/c missing info
         if next_end - next_start < datetime.timedelta(hours=MIN_SLOT_HRS):
             break
 
@@ -116,17 +114,15 @@ def book_room_for_group(members, is_wharton, room, lid, start, end):
     # but get reservation credits first to see how much we can book
     for member in failed_members:
         session_id = get_session_id_for_user(member['user'])
-        if (member['username'] == 'rehaan'):
-            session_id = 'tsleg35vwgexb34xnkzu5e5nruoynjva' #custom override for testing purposes
 
         if next_end - next_start < datetime.timedelta(hours=MIN_SLOT_HRS):
             break  # booked everything already
         if (is_wharton and session_id == None) or (not is_wharton and member["user__email"] == ""):
-            continue # this member cannot be used for huntsman booking b/c missing info
+            continue # this member cannot be used for booking b/c missing info
 
         # calculate number of credits already used via getReservations
         (success, used_credit_hours) = get_used_booking_credit_for_user(
-            lid, member["user__email"]
+            lid, member["user__email"], session_id
         )
         remaining_credit_hours = MAX_SLOT_HRS - used_credit_hours
         rounded_remaining_credit_hours = math.floor(2 * remaining_credit_hours) / 2
@@ -162,9 +158,15 @@ def book_room_for_group(members, is_wharton, room, lid, start, end):
 
 
 def is_fatal_error(error):
-    # consider all errors fatal unless its a daily limit error
+    """
+    fatal errors should halt the booking algorithm right away, and return the current bookings
+    non-fatal errors include running out of reservation credits; everything else is considered a fatal error
+    """
     if error is not None:
-        return not ("daily limit".lower() in (str(error)).lower())
+        error = str(error).lower()
+        if "daily limit" in error or "reservation limit" in error:
+            return False
+        return True
     return False
 
 
@@ -219,14 +221,15 @@ def construct_room_json_obj(succesful_booking_slots, lid, room, end, next_start,
     return (room_json, complete_success, partial_success)
 
 
-def get_used_booking_credit_for_user(lid, email):
+def get_used_booking_credit_for_user(lid, email, session_id):
     """ returns a user's used booking credit (in hours) for a specific building (lid) """
-    RESERVATIONS_URL = "https://api.pennlabs.org/studyspaces/reservations"
-    if lid == "1":
-        print("LOL")
-        return (False, 0)  # doesn't support huntsman yet
+    reservations_url = "https://api.pennlabs.org/studyspaces/reservations"
+    if lid == 1:
+        reservations_url = reservations_url + "?sessionid=" + session_id
+    else:
+        reservations_url = reservations_url + "?email=" + email
     try:
-        r = requests.get(RESERVATIONS_URL + "?email=" + email)
+        r = requests.get(reservations_url)
         if r.status_code == 200:
             resp_data = r.json()
             reservations = resp_data["reservations"]
@@ -321,7 +324,6 @@ def book_room_for_user(room, lid, start, end, email, session_id):
                 raise BookingError(resp_data["error"])
             return resp_data["results"]
 
-        print(r.status_code)
     except requests.exceptions.RequestException as e:
         print("error: " + str(e))
     return False
