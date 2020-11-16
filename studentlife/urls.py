@@ -9,6 +9,7 @@ admin.site.site_header = "Student Life Admin"
 
 urlpatterns = [
     path("", include("gsr_booking.urls")),
+    path("polls/", include("polls.urls")),
     path("admin/", admin.site.urls),
     path("accounts/", include("accounts.urls", namespace="accounts")),
     path(

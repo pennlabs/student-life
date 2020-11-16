@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     "django_filters",
     "debug_toolbar",
     "gsr_booking",
+    "polls.apps.PollsConfig",
     "legacy",
     "options.apps.OptionsConfig",
 ]
