@@ -6,7 +6,7 @@ class PollSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Poll
-        fields = ["question", "org_author"]
+        fields = ["question", "org_author", 'id']
 
     def create(self, validated_data):
         request = self.context.get("request", None)
